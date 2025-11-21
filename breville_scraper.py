@@ -1,200 +1,159 @@
-"""
-breville_scraper.py
-Purpose: Read product URLs from an Excel file and scrape product details from Breville product pages.
-Author: Pankaj Kumar
-Date: 2025-06-18
-Usage: python breville_scraper.py --input input.xlsx --output out.xlsx
-"""
-
 import os
 import time
 import random
-import argparse
-import logging
-from typing import List, Dict, Any
 import pandas as pd
 
+from typing import List, Dict
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.common.action_chains import ActionChains
 from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException, WebDriverException
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
-# ---- Defaults / CONFIG ----
-DEFAULT_MAX_RETRIES = 2
-BATCH_SAVE_SIZE = 20  # auto-save after this many rows
+# --- Configuration ---
+INPUT_FILE = r"D:\Pankaj Data\000000000\2025\June\18\Input File\breville-LINK.xlsx"
+OUTPUT_FOLDER = r"D:\Pankaj Data\000000000\2025\June\18\output File"
+OUTPUT_FILE = os.path.join(OUTPUT_FOLDER, "breville_scraped_output.xlsx")
 
-# ---- Logging ----
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
+MAX_RETRIES = 2
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+# --- Read Input ---
+df = pd.read_excel(INPUT_FILE)
+
+# --- Selenium Setup ---
+options = webdriver.ChromeOptions()
+options.add_argument('--start-maximized')
+options.page_load_strategy = 'eager'
+
+driver = webdriver.Chrome(
+    service=ChromeService(ChromeDriverManager().install()),
+    options=options
 )
-logger = logging.getLogger(__name__)
+driver.set_page_load_timeout(60)
+wait = WebDriverWait(driver, 10)
+actions = ActionChains(driver)
 
-# ---- Helpers ----
-def setup_driver() -> webdriver.Chrome:
-    opts = webdriver.ChromeOptions()
-    opts.add_argument("--start-maximized")
-    opts.page_load_strategy = "eager"
-    driver = webdriver.Chrome(
-        service=ChromeService(ChromeDriverManager().install()),
-        options=opts
-    )
-    driver.set_page_load_timeout(60)
-    return driver
-
-def human_scroll(driver: webdriver.Chrome) -> None:
-    """Scroll a page in small steps to ensure lazy-loaded content appears."""
-    try:
-        height = driver.execute_script("return document.body.scrollHeight")
-        step = random.randint(200, 400)
-        for y in range(0, height, step):
-            driver.execute_script(f"window.scrollTo(0, {y})")
-            time.sleep(random.uniform(0.25, 0.7))
-        time.sleep(random.uniform(0.5, 1.0))
-    except WebDriverException:
-        logger.debug("Scrolling failed; continuing.")
-
-def safe_get(driver: webdriver.Chrome, url: str, max_retries: int = DEFAULT_MAX_RETRIES) -> None:
-    """Navigate to URL with a small retry-on-timeout strategy."""
-    for attempt in range(1, max_retries + 2):
+# --- Helper Functions ---
+def safe_get(url: str):
+    for attempt in range(1, MAX_RETRIES + 2):
         try:
             driver.get(url)
-            human_scroll(driver)
+            human_scroll()
             return
         except TimeoutException:
-            logger.warning("Attempt %d timed out for %s; stopping load and retrying...", attempt, url)
+            print(f"[!] Attempt {attempt} timed out for {url!r}, stopping load...")
             driver.execute_script("window.stop();")
             time.sleep(1.5 * attempt)
-    raise TimeoutException(f"Failed to load {url} after {max_retries+1} attempts")
+    raise TimeoutException(f"Failed to load {url!r} after {MAX_RETRIES+1} attempts")
 
-def safe_find_text(driver: webdriver.Chrome, xpath: str, timeout: float = 4.0) -> str:
-    """Try explicit wait for element then return text or empty string."""
+def human_scroll():
+    scroll_height = driver.execute_script("return document.body.scrollHeight")
+    for y in range(0, scroll_height, random.randint(200, 400)):
+        driver.execute_script(f"window.scrollTo(0, {y})")
+        time.sleep(random.uniform(0.3, 0.8))
+    time.sleep(random.uniform(0.5, 1.5))
+
+def get_text(xpath: str) -> str:
     try:
-        wait = WebDriverWait(driver, timeout)
-        el = wait.until(EC.presence_of_element_located((By.XPATH, xpath)))
-        return el.text.strip()
-    except Exception:
-        # fallback: try direct find (faster if element already present), otherwise return ""
+        return driver.find_element(By.XPATH, xpath).text.strip()
+    except NoSuchElementException:
+        return ""
+
+def get_html(xpath: str) -> str:
+    try:
+        return driver.find_element(By.XPATH, xpath).get_attribute("innerHTML").strip()
+    except NoSuchElementException:
+        return ""
+
+def get_all_images() -> List[str]:
+    for list_id in ["splide01-list", "splide03-list"]:
         try:
-            return driver.find_element(By.XPATH, xpath).text.strip()
-        except Exception:
-            return ""
+            imgs = driver.find_elements(By.XPATH, f'//ul[@id="{list_id}"]//img')
+            if imgs:
+                return [img.get_attribute("src") for img in imgs if img.get_attribute("src")]
+        except NoSuchElementException:
+            continue
+    return []
 
-def get_all_images(driver: webdriver.Chrome, xpath: str) -> List[str]:
+def get_all_links(xpath: str) -> List[Dict]:
     try:
-        imgs = driver.find_elements(By.XPATH, f"{xpath}//img")
-        return [img.get_attribute("src") for img in imgs if img.get_attribute("src")]
-    except Exception:
+        els = driver.find_elements(By.XPATH, xpath)
+        return [{"text": el.text.strip(), "href": el.get_attribute("href")} for el in els]
+    except NoSuchElementException:
         return []
 
-def process_row(driver: webdriver.Chrome, row: pd.Series) -> Dict[str, Any]:
-    url = str(row.get("URL", "")).strip()
-    input_title = str(row.get("Title", "")).strip()
-    logger.info("Processing: %s", url)
-
-    scraped = {
-        "Input Title": input_title,
-        "URL": url,
-        "Title": "",
-        "Price": "",
-        "Color Text": "",
-        "Description Text": "",
-        "Specification Text": "",
-        "Teaser Text": "",
-        "Images": [],
-        "Support Docs": [],
-        "Swatch Model Sections": []
-    }
-
+def get_all_teaser_html() -> str:
     try:
-        safe_get(driver, url)
-    except TimeoutException as e:
-        logger.error("Timeout loading %s: %s", url, e)
-        raise
-
-    time.sleep(random.uniform(1.0, 2.5))  # short pause after load
-
-    scraped["Title"] = safe_find_text(driver, "//h1")
-    scraped["Price"] = safe_find_text(driver, '//div[@class="pdp-productPrice"]')
-    scraped["Color Text"] = safe_find_text(driver, '//p[@class="xps-text xps-text-p3-bold pdp-atc-controls__color"]')
-    scraped["Description Text"] = safe_find_text(driver, '//div[@class="xps-card-tile xps-card-tile-content-center"]')
-    scraped["Specification Text"] = safe_find_text(driver, '//div[@class="xps-product-specifications"]')
-    scraped["Teaser Text"] = safe_find_text(driver, '//div[@class="xps-teaser__content"]')
-    scraped["Images"] = get_all_images(driver, '//ul[@id="splide03-list"]')
-
-    # Support docs (link + text)
-    try:
-        links = driver.find_elements(By.XPATH, '//a[@class="xps-support-doc-item-link"]')
-        scraped["Support Docs"] = [{"text": l.text.strip(), "href": l.get_attribute("href")} for l in links if l.get_attribute("href")]
+        container = driver.find_element(By.XPATH, '//div[@class="xps-teaser__content"]').find_element(By.XPATH, "..")
+        sibling_divs = container.find_elements(By.XPATH, './*')
+        return "\n\n".join(el.get_attribute("outerHTML") for el in sibling_divs if el.tag_name.lower() == "div")
     except Exception:
-        scraped["Support Docs"] = []
+        return ""
 
-    # Swatch handling
-    try:
-        swatches = driver.find_elements(By.XPATH, '//div[@class="xps-swatchpicker-container"]//button')
-        models = []
-        for sw in swatches:
-            try:
-                driver.execute_script("arguments[0].click();", sw)
-                time.sleep(0.8)
-                models.append(safe_find_text(driver, '//div[@class="pdp-atc-controls-model-section"]'))
-            except Exception:
-                continue
-        scraped["Swatch Model Sections"] = models
-    except Exception:
-        scraped["Swatch Model Sections"] = []
+# --- Main Scraping Logic ---
+results = []
+retry_list = []
+start_time = time.time()
 
-    return scraped
+try:
+    for idx, row in df.iterrows():
+        url = row.get("URL", "").strip()
+        input_title = row.get("Title", "").strip()
+        print(f"[{idx+1}/{len(df)}] Loading: {url}")
 
-def save_results(results: List[Dict[str, Any]], path: str) -> None:
-    """Save results to Excel; overwrite intentionally for simplicity."""
-    pd.DataFrame(results).to_excel(path, index=False)
-    logger.info("Saved %d rows to %s", len(results), path)
+        try:
+            safe_get(url)
+        except TimeoutException as e:
+            print(f"  ✗ {e}")
+            retry_list.append(url)
+            continue
 
-# ---- Main runnable ----
-def main(args):
-    os.makedirs(args.output_folder, exist_ok=True)
-    driver = setup_driver()
-    results = []
-    failed = []
-    df = pd.read_excel(args.input_file)
+        time.sleep(random.uniform(2, 4))
 
-    try:
-        for idx, row in df.iterrows():
-            try:
-                scraped = process_row(driver, row)
-                results.append(scraped)
-            except Exception as e:
-                url = str(row.get("URL", ""))
-                failed.append(url)
-                logger.exception("Failed to scrape %s", url)
+        scraped = {
+            "Input Title": input_title,
+            "URL": url,
+            "Title": get_text("//h1"),
+            "Price": get_text('//div[@class="pdp-productPrice"]'),
+            "Color Text": get_text('//p[@class="xps-text xps-text-p3-bold pdp-atc-controls__color"]'),
+            "Description Text": get_text('//div[@class="xps-card-tile xps-card-tile-content-center"]'),
+            "Description HTML": get_html('//div[@class="xps-card-tile xps-card-tile-content-center"]'),
+            "Specification Text": get_text('//div[@class="xps-product-specifications"]'),
+            "Specification HTML": get_html('//div[@class="xps-product-specifications"]'),
+            "Teaser HTML": get_all_teaser_html(),
+            "Images": get_all_images(),
+            "Support Docs": get_all_links('//a[@class="xps-support-doc-item-link"]'),
+        }
 
-            # periodic save
-            if (idx + 1) % args.batch_size == 0:
-                save_results(results, args.output_file)
+        try:
+            swatches = driver.find_elements(By.XPATH, '//div[@class="xps-swatchpicker-container"]//button')
+            models = []
+            for sw in swatches:
+                try:
+                    driver.execute_script("arguments[0].click();", sw)
+                    time.sleep(1)
+                    models.append(get_text('//div[@class="pdp-atc-controls-model-section"]'))
+                except Exception:
+                    continue
+            scraped["Swatch Model Sections"] = models
+        except Exception:
+            scraped["Swatch Model Sections"] = []
 
-        # final save
-        save_results(results, args.output_file)
+        results.append(scraped)
+        print(f"  ✓ Scraped: {input_title or url}")
 
-        if failed:
-            pd.DataFrame({"Failed URLs": failed}).to_excel(os.path.join(args.output_folder, "failed_urls.xlsx"), index=False)
-            logger.warning("There were %d failed URLs. See failed_urls.xlsx", len(failed))
+    pd.DataFrame(results).to_excel(OUTPUT_FILE, index=False)
+    print(f"→ Saved all scraped results: {len(results)} rows")
 
-    finally:
-        driver.quit()
+    if retry_list:
+        pd.DataFrame({"Failed URLs": retry_list})\
+            .to_excel(os.path.join(OUTPUT_FOLDER, "breville_failed_urls.xlsx"), index=False)
+        print(f"⚠️ {len(retry_list)} URLs failed; see 'breville_failed_urls.xlsx'")
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Breville product scraper")
-    parser.add_argument("--input-file", required=True)
-    parser.add_argument("--output-folder", required=True)
-    parser.add_argument("--output-file", default=None)
-    parser.add_argument("--batch-size", type=int, default=BATCH_SAVE_SIZE)
-    parsed = parser.parse_args()
+    print(f"\n✅ Scraping completed in {round((time.time() - start_time)/60, 2)} minutes.")
 
-    output_file = parsed.output_file or os.path.join(parsed.output_folder, "breville_scraped_output.xlsx")
-    parsed.output_file = output_file
-    main(parsed)
+finally:
+    driver.quit()
